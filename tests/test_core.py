@@ -101,6 +101,33 @@ def test_pick_best_pair_ignores_other_chains():
     assert market.pick_best_pair(pairs, a)["id"] == "ok"
 
 
+def test_parse_real_dexscreener_pairs():
+    """Extrait d'une vraie réponse DexScreener du 03/11/2026 (AERO sur Base, deux pools)."""
+    a = WHITELIST["AERO"]
+    pairs = [
+        {"chainId": "base", "dexId": "uniswap", "baseToken": {"address": a, "symbol": "AERO"},
+         "priceUsd": "0.6325", "volume": {"h24": 408631.22}, "priceChange": {"h1": -0.76, "h24": 1.82},
+         "liquidity": {"usd": 177755.57}, "url": "u"},
+        {"chainId": "base", "dexId": "aerodrome", "baseToken": {"address": a, "symbol": "AERO"},
+         "priceUsd": "0.6340", "volume": {"h24": 492656.08}, "priceChange": {"m5": -0.13, "h1": -0.57, "h24": 1.82},
+         "liquidity": {"usd": 5434981.89}, "url": "https://dexscreener.com/base/0x6cdcb1c4a4d1c3c6d054b27ac5b77e89eafb971d"},
+    ]
+    qt = market.parse_quote("AERO", a, market.pick_best_pair(pairs, a))
+    assert qt.price_usd == 0.634 and qt.liquidity_usd == pytest.approx(5434981.89)
+    assert qt.change_1h == -0.57 and qt.volume_24h_usd == pytest.approx(492656.08)
+
+
+def test_fetch_quotes_queries_each_token_separately():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"pairs": []})
+
+    market.fetch_quotes(WHITELIST, httpx.Client(transport=httpx.MockTransport(handler)))
+    assert len(seen) == len(WHITELIST) and all("," not in p for p in seen)
+
+
 # --- X / RAG --------------------------------------------------------------
 
 def test_x_store_search_and_attention(conn):
@@ -121,7 +148,8 @@ def test_full_cycle_with_mocked_dexscreener(conn, monkeypatch):
     def handler(request):
         pairs = [{"chainId": "base", "url": "", "baseToken": {"address": a, "symbol": s},
                   "priceUsd": "2.0", "liquidity": {"usd": 5e6}, "volume": {"h24": 1e6},
-                  "priceChange": {"h1": 3, "h24": 18}} for s, a in WHITELIST.items()]
+                  "priceChange": {"h1": 3, "h24": 18}} for s, a in WHITELIST.items()
+                 if a.lower() in str(request.url).lower()]
         return httpx.Response(200, json={"pairs": pairs})
 
     real = market.fetch_quotes

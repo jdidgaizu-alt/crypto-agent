@@ -49,20 +49,27 @@ def parse_quote(symbol: str, address: str, pair: dict) -> Quote | None:
 
 
 def fetch_quotes(tokens: dict[str, str], client: httpx.Client | None = None) -> dict[str, Quote]:
+    """Une requête par jeton : l'API tronque la réponse à 30 paires, toutes chaînes confondues,
+    donc une requête groupée fait disparaître les jetons les moins représentés (constaté le 03/11/2026)."""
     own = client is None
     client = client or httpx.Client(timeout=20)
+    out: dict[str, Quote] = {}
     try:
-        addrs = ",".join(tokens.values())
-        r = client.get(f"{API}/latest/dex/tokens/{addrs}")
-        r.raise_for_status()
-        pairs = r.json().get("pairs") or []
+        for sym, addr in tokens.items():
+            r = client.get(f"{API}/latest/dex/tokens/{addr}")
+            r.raise_for_status()
+            pairs = r.json().get("pairs") or []
+            pair = pick_best_pair(pairs, addr)
+            q = parse_quote(sym, addr, pair) if pair else None
+            if q:
+                # Volume du jeton = somme de tous ses pools sur Base, pas seulement le principal.
+                q.volume_24h_usd = sum(
+                    float((p.get("volume") or {}).get("h24") or 0) for p in pairs
+                    if p.get("chainId") == CHAIN_ID
+                    and p.get("baseToken", {}).get("address", "").lower() == addr.lower()
+                )
+                out[sym] = q
     finally:
         if own:
             client.close()
-    out: dict[str, Quote] = {}
-    for sym, addr in tokens.items():
-        pair = pick_best_pair(pairs, addr)
-        q = parse_quote(sym, addr, pair) if pair else None
-        if q:
-            out[sym] = q
     return out
