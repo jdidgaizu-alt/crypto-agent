@@ -1,84 +1,260 @@
-"""Portefeuille fictif : exécute les ordres aux vrais prix en comptant frais, gaz et impact de prix."""
+"""Livres de simulation : ordres aux vrais prix, frais réels, impact de prix, valorisation prudente.
+
+Deux livres séparés partagent ce code : « auto » (la stratégie systématique) et « claude »
+(les décisions prises par Claude via MCP). Chacun a son capital, ses positions, sa
+référence ETH et son arrêt d'urgence, pour que l'un ne fausse pas l'évaluation de l'autre.
+
+buy() et sell_all() s'exécutent DANS une transaction ouverte par write_tx : la lecture
+du cash ou de la position et l'écriture qui en dépend sont donc atomiques.
+"""
+import json
+import math
 import sqlite3
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
+from . import fees
 from .config import COSTS, RISK
+from .db import savepoint, write_tx
+from .market import Quote
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+class Refused(ValueError):
+    """Ordre refusé pour une raison attendue (montant, garde-fou, liquidité, cash)."""
 
 
-def init(conn: sqlite3.Connection, capital: float = RISK.start_capital_usdc) -> None:
-    conn.execute("INSERT OR IGNORE INTO cash(id, usdc) VALUES (1, ?)", (capital,))
-    conn.commit()
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def cash(conn: sqlite3.Connection) -> float:
-    return conn.execute("SELECT usdc FROM cash WHERE id = 1").fetchone()["usdc"]
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
-def positions(conn: sqlite3.Connection) -> dict[str, dict]:
-    return {r["symbol"]: dict(r) for r in conn.execute("SELECT * FROM positions")}
+def parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s)
 
+
+# --- livres -----------------------------------------------------------------
+
+def check_amount(usdc) -> float:
+    if isinstance(usdc, bool) or not isinstance(usdc, (int, float)):
+        raise Refused("montant manquant ou non numérique")
+    v = float(usdc)
+    if not math.isfinite(v) or v <= 0:
+        raise Refused("le montant doit être un nombre positif fini")
+    return v
+
+
+def create_book(conn: sqlite3.Connection, name: str, capital: float, now: datetime | None = None) -> None:
+    capital = check_amount(capital)
+    with write_tx(conn):
+        if conn.execute("SELECT 1 FROM books WHERE name = ?", (name,)).fetchone():
+            raise Refused(f"le livre « {name} » existe déjà")
+        conn.execute("INSERT INTO books(name, capital_usdc, cash_usdc, created_at) VALUES (?,?,?,?)",
+                     (name, capital, capital, iso(now or utcnow())))
+
+
+def get_book(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM books WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        raise LookupError(f"livre « {name} » absent : lancez `python -m crypto_agent.cycle --init`")
+    return row
+
+
+def positions(conn: sqlite3.Connection, book: str) -> dict[str, dict]:
+    return {r["symbol"]: dict(r) for r in conn.execute("SELECT * FROM positions WHERE book = ?", (book,))}
+
+
+# --- ordres -----------------------------------------------------------------
 
 def price_impact(usdc: float, liquidity_usd: float) -> float:
-    """Approximation d'un pool à produit constant : impact ≈ 2 × montant / liquidité totale."""
-    if liquidity_usd <= 0:
-        return 1.0
+    """Pool à produit constant : prix moyen d'un achat = prix × (1 + 2 × montant / liquidité totale)."""
+    if not liquidity_usd > 0:
+        return math.inf
     return 2 * usdc / liquidity_usd
 
 
-def equity(conn: sqlite3.Connection, prices: dict[str, float]) -> float:
-    total = cash(conn)
-    for sym, p in positions(conn).items():
-        total += p["qty"] * prices.get(sym, p["cost_usdc"] / p["qty"])
-    return total
-
-
-def trades_today(conn: sqlite3.Connection) -> int:
-    day = now_iso()[:10]
-    return conn.execute("SELECT COUNT(*) FROM trades WHERE substr(ts,1,10) = ?", (day,)).fetchone()[0]
-
-
-def buy(conn, symbol: str, usdc: float, price: float, liquidity_usd: float, reason: str) -> dict:
-    impact = price_impact(usdc, liquidity_usd)
+def buy(conn: sqlite3.Connection, book: str, q: Quote, usdc: float, reason: str,
+        now: datetime | None = None) -> dict:
+    now = now or utcnow()
+    usdc = check_amount(usdc)
+    if usdc < RISK.min_order_usdc:
+        raise Refused(f"montant minimum {RISK.min_order_usdc:g} USDC")
+    if not q.price_usd > 0:
+        raise Refused(f"prix invalide pour {q.symbol}")
+    impact = price_impact(usdc, q.liquidity_usd)
     if impact > COSTS.max_price_impact:
-        raise ValueError(f"impact de prix estimé {impact:.2%} > {COSTS.max_price_impact:.0%}")
-    available = cash(conn)
-    if usdc + COSTS.gas_usd > available + 1e-9:
-        raise ValueError(f"liquidités insuffisantes ({available:.2f} USDC)")
-    fees = usdc * COSTS.dex_fee + COSTS.gas_usd
-    exec_price = price * (1 + impact)
-    qty = usdc * (1 - COSTS.dex_fee) / exec_price
-    conn.execute("UPDATE cash SET usdc = usdc - ? WHERE id = 1", (usdc + COSTS.gas_usd,))
-    conn.execute(
-        "INSERT INTO positions(symbol, qty, cost_usdc, opened_at) VALUES (?,?,?,?) "
-        "ON CONFLICT(symbol) DO UPDATE SET qty = qty + excluded.qty, cost_usdc = cost_usdc + excluded.cost_usdc",
-        (symbol, qty, usdc + COSTS.gas_usd, now_iso()),
-    )
-    conn.execute(
-        "INSERT INTO trades(ts, symbol, side, qty, price, usdc, fees_usdc, reason) VALUES (?,?,?,?,?,?,?,?)",
-        (now_iso(), symbol, "buy", qty, exec_price, usdc, fees, reason),
-    )
-    conn.commit()
-    return {"symbol": symbol, "side": "buy", "qty": qty, "price": exec_price, "fees": fees}
+        raise Refused(f"impact de prix estimé {impact:.2%} > {COSTS.max_price_impact:.0%}")
+    rate = fees.total_fee_rate(q)
+    exec_price = q.price_usd * (1 + impact)
+    qty = usdc * (1 - rate) / exec_price
+    debit = usdc + COSTS.gas_usd
+    fees_usdc = usdc * rate + COSTS.gas_usd
+    with savepoint(conn):
+        cur = conn.execute("UPDATE books SET cash_usdc = cash_usdc - ? WHERE name = ? AND cash_usdc >= ?",
+                           (debit, book, debit))
+        if cur.rowcount != 1:
+            raise Refused(f"liquidités insuffisantes pour {debit:.2f} USDC")
+        conn.execute(
+            "INSERT INTO positions(book, symbol, qty, cost_usdc, opened_at, last_price, last_price_at) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(book, symbol) DO UPDATE SET qty = qty + excluded.qty, "
+            "cost_usdc = cost_usdc + excluded.cost_usdc, last_price = excluded.last_price, "
+            "last_price_at = excluded.last_price_at",
+            (book, q.symbol, qty, debit, iso(now), q.price_usd, iso(now)),
+        )
+        conn.execute(
+            "INSERT INTO trades(book, ts, symbol, side, qty, price, usdc, fees_usdc, fee_rate, pool, reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (book, iso(now), q.symbol, "buy", qty, exec_price, usdc, fees_usdc, rate, q.pair_address, reason),
+        )
+    return {"symbol": q.symbol, "side": "buy", "qty": qty, "price": exec_price, "usdc": usdc,
+            "fees": fees_usdc, "fee_rate": rate}
 
 
-def sell_all(conn, symbol: str, price: float, liquidity_usd: float, reason: str) -> dict:
-    pos = positions(conn).get(symbol)
-    if not pos:
-        raise ValueError(f"aucune position sur {symbol}")
-    gross = pos["qty"] * price
-    impact = min(price_impact(gross, liquidity_usd), 0.5)
-    exec_price = price * (1 - impact)
-    proceeds = pos["qty"] * exec_price * (1 - COSTS.dex_fee) - COSTS.gas_usd
-    fees = pos["qty"] * exec_price * COSTS.dex_fee + COSTS.gas_usd
-    conn.execute("UPDATE cash SET usdc = usdc + ? WHERE id = 1", (proceeds,))
-    conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
+def sell_all(conn: sqlite3.Connection, book: str, q: Quote, reason: str, now: datetime | None = None) -> dict:
+    now = now or utcnow()
+    with savepoint(conn):
+        pos = conn.execute("SELECT qty, cost_usdc FROM positions WHERE book = ? AND symbol = ?",
+                           (book, q.symbol)).fetchone()
+        if pos is None:
+            raise Refused(f"aucune position sur {q.symbol}")
+        if not (q.price_usd > 0 and q.liquidity_usd > 0):
+            raise Refused(f"prix ou liquidité nuls sur {q.symbol} : vente impossible")
+        rate = fees.total_fee_rate(q)
+        gross = pos["qty"] * q.price_usd
+        # Pool à produit constant, formule exacte : la recette tend vers 0 quand la liquidité s'effondre.
+        exec_price = q.price_usd / (1 + 2 * gross / q.liquidity_usd)
+        out = pos["qty"] * exec_price
+        proceeds = out * (1 - rate) - COSTS.gas_usd
+        fees_usdc = out * rate + COSTS.gas_usd
+        cur = conn.execute("DELETE FROM positions WHERE book = ? AND symbol = ?", (book, q.symbol))
+        if cur.rowcount != 1:
+            raise RuntimeError("position modifiée pendant la vente")
+        conn.execute("UPDATE books SET cash_usdc = cash_usdc + ? WHERE name = ?", (proceeds, book))
+        conn.execute(
+            "INSERT INTO trades(book, ts, symbol, side, qty, price, usdc, fees_usdc, fee_rate, pool, reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (book, iso(now), q.symbol, "sell", pos["qty"], exec_price, proceeds, fees_usdc, rate,
+             q.pair_address, reason),
+        )
+    return {"symbol": q.symbol, "side": "sell", "qty": pos["qty"], "price": exec_price,
+            "proceeds": proceeds, "fees": fees_usdc, "pnl": proceeds - pos["cost_usdc"]}
+
+
+# --- valorisation -----------------------------------------------------------
+
+def mark_prices(conn: sqlite3.Connection, book: str, quotes: dict[str, Quote], now: datetime) -> None:
+    """Retient le dernier prix observé de chaque position (à appeler dans une transaction)."""
+    for sym, q in quotes.items():
+        conn.execute("UPDATE positions SET last_price = ?, last_price_at = ? WHERE book = ? AND symbol = ?",
+                     (q.price_usd, iso(now), book, sym))
+
+
+@dataclass
+class Valuation:
+    cash: float
+    equity: float                 # positions au dernier prix connu
+    risk_equity: float            # positions sans prix depuis plus de stale_quote_hours comptées pour 0
+    stale: list[str]
+    positions: dict[str, dict]
+
+
+def value(conn: sqlite3.Connection, book: str, now: datetime | None = None,
+          live: dict[str, float] | None = None) -> Valuation:
+    """Jamais au prix de revient : une position sans cotation garde son dernier prix observé,
+    et sort du capital à risque quand ce prix devient trop ancien."""
+    now = now or utcnow()
+    limit = now - timedelta(hours=RISK.stale_quote_hours)
+    b = get_book(conn, book)
+    pos = positions(conn, book)
+    equity = risk = b["cash_usdc"]
+    stale = []
+    for sym, p in pos.items():
+        if live and sym in live:
+            price, fresh = live[sym], True
+        else:
+            price, fresh = p["last_price"], parse_iso(p["last_price_at"]) >= limit
+        p["value_usdc"] = p["qty"] * price
+        p["price_fresh"] = fresh
+        equity += p["value_usdc"]
+        if fresh:
+            risk += p["value_usdc"]
+        else:
+            stale.append(sym)
+    return Valuation(b["cash_usdc"], equity, risk, stale, pos)
+
+
+def trades_today(conn: sqlite3.Connection, book: str, now: datetime) -> int:
+    day = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return conn.execute("SELECT COUNT(*) FROM trades WHERE book = ? AND ts >= ?", (book, iso(day))).fetchone()[0]
+
+
+def recently_sold(conn: sqlite3.Connection, book: str, now: datetime) -> set[str]:
+    since = iso(now - timedelta(hours=RISK.rebuy_cooldown_hours))
+    rows = conn.execute("SELECT DISTINCT symbol FROM trades WHERE book = ? AND side = 'sell' AND ts >= ?",
+                        (book, since))
+    return {r[0] for r in rows}
+
+
+# --- référence ETH, arrêt, instantanés --------------------------------------
+
+def ensure_benchmark(conn: sqlite3.Connection, book: str, weth_price: float, now: datetime) -> None:
+    """Fixe la référence une seule fois : tout le capital de DÉPART placé en ETH.
+    À appeler dans la transaction, avant tout ordre."""
+    if weth_price and weth_price > 0:
+        conn.execute("UPDATE books SET bench_weth_qty = capital_usdc / ?, bench_at = ? "
+                     "WHERE name = ? AND bench_weth_qty IS NULL", (weth_price, iso(now), book))
+
+
+def benchmark_value(conn: sqlite3.Connection, book: str, weth_price: float | None) -> float | None:
+    b = get_book(conn, book)
+    if b["bench_weth_qty"] is None or not weth_price:
+        return None
+    return b["bench_weth_qty"] * weth_price
+
+
+def halt(conn: sqlite3.Connection, book: str, reason: str, now: datetime) -> None:
+    conn.execute("UPDATE books SET halted_reason = ?, halted_at = ? WHERE name = ? AND halted_reason IS NULL",
+                 (reason, iso(now), book))
+
+
+def reset_halt(conn: sqlite3.Connection, book: str) -> bool:
+    """Décision humaine uniquement (ligne de commande) : aucun outil MCP n'y donne accès."""
+    with write_tx(conn):
+        cur = conn.execute("UPDATE books SET halted_reason = NULL, halted_at = NULL "
+                           "WHERE name = ? AND halted_reason IS NOT NULL", (book,))
+    return cur.rowcount == 1
+
+
+def snapshot(conn: sqlite3.Connection, book: str, now: datetime, val: Valuation,
+             benchmark: float | None, note: dict) -> None:
     conn.execute(
-        "INSERT INTO trades(ts, symbol, side, qty, price, usdc, fees_usdc, reason) VALUES (?,?,?,?,?,?,?,?)",
-        (now_iso(), symbol, "sell", pos["qty"], exec_price, proceeds, fees, reason),
+        "INSERT INTO snapshots(book, ts, equity_usdc, risk_equity_usdc, benchmark_usdc, stale, note) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (book, iso(now), val.equity, val.risk_equity, benchmark, json.dumps(val.stale),
+         json.dumps(note, ensure_ascii=False, default=str)),
     )
-    conn.commit()
-    return {"symbol": symbol, "side": "sell", "proceeds": proceeds, "pnl": proceeds - pos["cost_usdc"]}
+
+
+def last_snapshot_at(conn: sqlite3.Connection, book: str) -> datetime | None:
+    row = conn.execute("SELECT MAX(ts) FROM snapshots WHERE book = ?", (book,)).fetchone()
+    return parse_iso(row[0]) if row and row[0] else None
+
+
+# --- verrou de cycle --------------------------------------------------------
+
+def acquire_lock(conn: sqlite3.Connection, name: str, holder: str, now: datetime,
+                 ttl_minutes: float = 15) -> bool:
+    with write_tx(conn):
+        row = conn.execute("SELECT acquired_at FROM locks WHERE name = ?", (name,)).fetchone()
+        if row and parse_iso(row["acquired_at"]) > now - timedelta(minutes=ttl_minutes):
+            return False
+        conn.execute("INSERT OR REPLACE INTO locks(name, holder, acquired_at) VALUES (?,?,?)",
+                     (name, holder, iso(now)))
+    return True
+
+
+def release_lock(conn: sqlite3.Connection, name: str, holder: str) -> None:
+    with write_tx(conn):
+        conn.execute("DELETE FROM locks WHERE name = ? AND holder = ?", (name, holder))
