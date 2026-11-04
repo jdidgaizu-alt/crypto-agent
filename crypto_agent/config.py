@@ -17,8 +17,19 @@ BASE_RPC_URL = os.environ.get("BASE_RPC_URL", "https://mainnet.base.org")
 BOOK_DB_PATH = Path(os.environ.get("CRYPTO_AGENT_DB", ROOT / "ledger" / "book.db"))
 X_DB_PATH = Path(os.environ.get("CRYPTO_AGENT_X_DB", ROOT / "data" / "x.db"))
 
-# Capital d'un livre neuf. Lu uniquement par `python -m crypto_agent.cycle --init`.
-DEFAULT_START_CAPITAL_USDC = float(os.environ.get("START_CAPITAL_USDC", "50"))
+MIN_START_CAPITAL_USDC = 10.0   # en dessous, aucun ordre ne passerait (20 % du capital < ordre minimum de 2 USDC)
+
+
+def start_capital() -> float:
+    """Capital d'un livre neuf. Lu uniquement par `python -m crypto_agent.cycle --init`, au moment de créer le livre."""
+    raw = os.environ.get("START_CAPITAL_USDC", "50")
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"START_CAPITAL_USDC illisible : {raw!r}") from None
+    if not value >= MIN_START_CAPITAL_USDC or value == float("inf"):
+        raise ValueError(f"START_CAPITAL_USDC doit être un nombre d'au moins {MIN_START_CAPITAL_USDC:g} USDC")
+    return value
 
 BOOK_AUTO = "auto"      # stratégie systématique, exécutée par le cycle
 BOOK_CLAUDE = "claude"  # décisions prises par Claude via la passerelle MCP
@@ -66,11 +77,12 @@ class Risk:
     take_profit: float = 0.25
     min_liquidity_usd: float = 500_000
     min_volume_24h_usd: float = 250_000
-    max_trades_per_day: int = 6              # plafonne les ENTRÉES ; une sortie n'est jamais bloquée
+    max_entries_per_day: int = 6             # achats par jour ; les ventes ne sont ni comptées ni bloquées
     buy_threshold: float = 0.35
     exit_threshold: float = -0.30
     rebuy_cooldown_hours: float = 24         # pas de rachat d'un jeton vendu depuis moins de 24 h
-    stale_quote_hours: float = 6             # au-delà, une position sans prix compte pour 0 dans le contrôle du risque
+    stale_quote_hours: float = 6             # au-delà, une position sans prix récent bloque les achats (risque inconnu)
+    lost_quote_hours: float = 72             # au-delà, elle compte pour 0 dans le capital à risque
     min_cycle_interval_minutes: float = 30
     cash_reserve_usdc: float = 0.5
     min_order_usdc: float = 2.0
@@ -92,7 +104,8 @@ class XBudget:
     monthly_usd: float = float(os.environ.get("X_MONTHLY_BUDGET_USD", "5"))
     count_request_usd: float = 0.005
     post_read_usd: float = 0.005
-    posts_per_symbol_per_cycle: int = int(os.environ.get("X_POSTS_PER_SYMBOL", "0"))
+    posts_per_symbol_per_cycle: int = int(os.environ.get("X_POSTS_PER_SYMBOL", "0") or 0)
+    min_baseline_posts: float = 30.0         # sous ce nombre moyen de posts par tranche de 6 h, l'attention n'est pas mesurée
     max_posts_per_call: int = 100
 
 

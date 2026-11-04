@@ -72,23 +72,84 @@ def test_kill_switch_liquidates_latches_and_survives_recovery(net, book_conn, x_
     all_flat(net, AERO=dict(h24=15, h1=3))
     log = run(net, book_conn, x_conn, now=T0 + timedelta(days=2))
     assert n_trades(book_conn, side="buy") == 3
-    assert portfolio.reset_halt(book_conn, "auto") is True       # décision humaine (ligne de commande)
+    res = portfolio.reset_halt(book_conn, "auto", T0 + timedelta(days=2))   # décision humaine (ligne de commande)
+    assert res["new_capital"] == pytest.approx(portfolio.get_book(book_conn, "auto")["cash_usdc"])
 
 
-def test_stale_position_triggers_the_kill_switch(net, book_conn, x_conn):
+def _two_positions_then_aero_unpriced(net, book_conn, bought_at):
     from conftest import mkq
     all_flat(net)
     with db.write_tx(book_conn):
         portfolio.ensure_benchmark(book_conn, "auto", 2.0, T0)
         for s in ("AERO", "BRETT"):
-            portfolio.buy(book_conn, "auto", mkq(s, price=2.0), 10, "test", T0 - timedelta(days=1))
+            portfolio.buy(book_conn, "auto", mkq(s, price=2.0), 10, "test", bought_at)
         book_conn.execute("UPDATE books SET cash_usdc = 20 WHERE name = 'auto'")
-    net.dex["AERO"] = 500                  # AERO n'a plus de prix depuis 24 h
-    log = run(net, book_conn, x_conn)
-    auto = log["books"]["auto"]
-    assert auto["stale"] == ["AERO"] and auto["risk_equity_usdc"] < 30
+    all_flat(net, DEGEN=dict(h24=15, h1=3))
+    net.dex["AERO"] = 500                  # AERO n'a plus de prix
+
+
+def test_one_day_price_outage_blocks_entries_but_does_not_liquidate(net, book_conn, x_conn, monkeypatch):
+    from crypto_agent import xsource
+    monkeypatch.setattr(xsource, "configured", lambda: True)
+    monkeypatch.setattr(xsource, "fetch_counts", lambda *a, **k: 0)
+    monkeypatch.setattr(xsource, "attention", lambda conn, sym, now=None: {"ratio": 3.0, "reason": None})
+    _two_positions_then_aero_unpriced(net, book_conn, T0 - timedelta(hours=24))
+    auto = run(net, book_conn, x_conn)["books"]["auto"]
+    assert auto["stale"] == ["AERO"] and auto["lost"] == [] and auto["halted"] is None
+    assert not any(d["action"] in ("halt", "sell", "buy") for d in auto["decisions"])
+    assert any("pas de prix récent pour AERO" in d["reason"] for d in auto["decisions"] if d["action"] == "warn")
+
+
+def test_position_lost_for_days_counts_zero_and_triggers_the_kill_switch(net, book_conn, x_conn):
+    _two_positions_then_aero_unpriced(net, book_conn, T0 - timedelta(days=4))
+    auto = run(net, book_conn, x_conn)["books"]["auto"]
+    assert auto["lost"] == ["AERO"] and auto["risk_equity_usdc"] < 30
     assert auto["decisions"][0]["action"] == "halt"
-    assert ("warn", "AERO") in [(d["action"], d["symbol"]) for d in auto["decisions"]]
+    assert ("sell", "BRETT") in [(d["action"], d["symbol"]) for d in auto["decisions"]]
+
+
+def test_a_refused_sell_does_not_open_a_fourth_position(net, book_conn, x_conn, monkeypatch):
+    from conftest import mkq, pair
+    from crypto_agent import xsource
+    monkeypatch.setattr(xsource, "configured", lambda: True)
+    monkeypatch.setattr(xsource, "fetch_counts", lambda *a, **k: 0)
+    monkeypatch.setattr(xsource, "attention", lambda conn, sym, now=None: {"ratio": 3.0, "reason": None})
+    all_flat(net)
+    with db.write_tx(book_conn):
+        portfolio.ensure_benchmark(book_conn, "auto", 2.0, T0)
+        for s in ("AERO", "BRETT", "DEGEN"):
+            portfolio.buy(book_conn, "auto", mkq(s, price=2.0), 10, "test", T0 - timedelta(hours=2))
+    all_flat(net, VIRTUAL=dict(h24=15, h1=3))
+    net.dex["AERO"] = [pair("AERO", price=1.0, liq=0.0)]      # stop-loss décidé, mais vente impossible
+    auto = run(net, book_conn, x_conn)["books"]["auto"]
+    sells = [d for d in auto["decisions"] if d["action"] == "sell"]
+    assert sells and "vente impossible" in sells[0]["refused"]
+    buys = [d for d in auto["decisions"] if d["action"] == "buy"]
+    assert buys and "3 positions ouvertes" in buys[0]["refused"]   # revérifié à l'exécution
+    assert len(portfolio.positions(book_conn, "auto")) == 3
+
+
+def test_a_cycle_charges_exactly_and_snapshots_the_comparison(net, book_conn, x_conn, monkeypatch):
+    from crypto_agent import xsource
+    from crypto_agent.config import COSTS
+    monkeypatch.setattr(xsource, "configured", lambda: True)
+    monkeypatch.setattr(xsource, "fetch_counts", lambda *a, **k: 0)
+    monkeypatch.setattr(xsource, "attention",
+                        lambda conn, sym, now=None: {"ratio": 3.0 if sym == "AERO" else None, "reason": None})
+    all_flat(net, AERO=dict(price=2.0, h24=15, h1=3), WETH=dict(price=2500.0))
+    log = run(net, book_conn, x_conn)
+    bought = [d["result"] for d in log["books"]["auto"]["decisions"] if d["action"] == "buy" and "result" in d]
+    assert [b["symbol"] for b in bought] == ["AERO"]
+    assert portfolio.get_book(book_conn, "auto")["cash_usdc"] == pytest.approx(50 - 10 - COSTS.gas_usd, abs=1e-12)
+    assert bought[0]["fee_rate"] == COSTS.unknown_pool_fee            # nœud injoignable : 1 % supposé
+    # Le lendemain, AERO +10 % et ETH +10 % : l'instantané enregistré compare les deux au même instant.
+    all_flat(net, AERO=dict(price=2.2), WETH=dict(price=2750.0))
+    run(net, book_conn, x_conn, now=T0 + timedelta(days=1))
+    snap = book_conn.execute("SELECT equity_usdc, benchmark_usdc FROM snapshots WHERE book = 'auto' "
+                             "ORDER BY id DESC LIMIT 1").fetchone()
+    qty = bought[0]["qty"]
+    assert snap["equity_usdc"] == pytest.approx(50 - 10.02 + qty * 2.2, abs=1e-9)
+    assert snap["benchmark_usdc"] == pytest.approx(55.0)
 
 
 def test_claude_book_gets_stop_loss_but_no_initiative(net, book_conn, x_conn):

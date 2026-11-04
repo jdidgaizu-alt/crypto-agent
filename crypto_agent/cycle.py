@@ -7,13 +7,14 @@
 Les décisions et les ordres d'un cycle forment UNE transaction : deux cycles lancés en même
 temps ne peuvent pas acheter deux fois le même jeton ni vendre deux fois la même position.
 Un verrou empêche en plus deux cycles de se chevaucher, et un intervalle minimum évite de
-multiplier les ordres en relançant le cycle.
+multiplier les ordres en relançant le cycle. Chaque achat est revérifié au moment de son
+exécution, contre l'état réel du livre.
 
 Ligne de commande :
     python -m crypto_agent.cycle --init              crée les livres (START_CAPITAL_USDC, 50 par défaut)
     python -m crypto_agent.cycle                     un cycle
     python -m crypto_agent.cycle --report            état des livres, sans réseau
-    python -m crypto_agent.cycle --reset-halt auto   lève l'arrêt d'urgence d'un livre (décision humaine)
+    python -m crypto_agent.cycle --reset-halt auto   relance un livre arrêté avec ce qu'il lui reste (décision humaine)
 """
 import argparse
 import json
@@ -25,13 +26,26 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from . import fees, market, portfolio, strategy, xsource
-from .config import (BOOK_AUTO, BOOK_CLAUDE, BOOK_DB_PATH, BOOKS, DEFAULT_START_CAPITAL_USDC, RISK, WHITELIST,
-                     X_BUDGET, X_DB_PATH, X_QUERIES)
+from .config import (BOOK_AUTO, BOOK_CLAUDE, BOOK_DB_PATH, BOOKS, RISK, WHITELIST, X_BUDGET, X_DB_PATH,
+                     X_QUERIES, start_capital)
 from .db import open_book, open_x, write_tx
 from .market import Quote
 
 MODES = {BOOK_AUTO: "full", BOOK_CLAUDE: "guard"}
 LOCK = "cycle"
+
+
+def _buy_refusal(conn: sqlite3.Connection, book: str, q: Quote, usdc: float, now: datetime) -> str | None:
+    """Garde-fous recalculés sur l'état RÉEL du livre au moment de l'achat (une vente prévue a pu échouer)."""
+    b = portfolio.get_book(conn, book)
+    val = portfolio.value(conn, book, now)
+    pos = val.positions.get(q.symbol)
+    return strategy.entry_refusal(
+        q=q, usdc=usdc, capital=b["capital_usdc"], cash=val.cash,
+        held_cost=pos["cost_usdc"] if pos else 0.0, held_value=pos["qty"] * q.price_usd if pos else 0.0,
+        open_count=len(val.positions), entries_count=portfolio.entries_today(conn, book, now),
+        halted=b["halted_reason"], risk_equity=val.risk_equity,
+        recently_sold=portfolio.recently_sold(conn, book, now), unpriced=val.stale)
 
 
 def _run_book(conn: sqlite3.Connection, book: str, mode: str, quotes: dict[str, Quote],
@@ -51,13 +65,16 @@ def _run_book(conn: sqlite3.Connection, book: str, mode: str, quotes: dict[str, 
         decisions = strategy.decide(
             quotes=quotes, attention=attention, positions=val.positions, cash=val.cash,
             risk_equity=val.risk_equity, capital=b["capital_usdc"],
-            trades_today=portfolio.trades_today(conn, book, now), halted=b["halted_reason"],
-            recently_sold=portfolio.recently_sold(conn, book, now), mode=mode,
+            entries_today=portfolio.entries_today(conn, book, now), halted=b["halted_reason"],
+            recently_sold=portfolio.recently_sold(conn, book, now), mode=mode, stale=val.stale,
         )
     for d in decisions:
         entry = {"action": d.action, "symbol": d.symbol, "usdc": d.usdc, "reason": d.reason}
         try:
             if d.action == "buy":
+                why = _buy_refusal(conn, book, quotes[d.symbol], d.usdc, now)
+                if why:
+                    raise portfolio.Refused(why)
                 entry["result"] = portfolio.buy(conn, book, quotes[d.symbol], d.usdc, d.reason, now)
             elif d.action == "sell":
                 entry["result"] = portfolio.sell_all(conn, book, quotes[d.symbol], d.reason, now)
@@ -69,10 +86,10 @@ def _run_book(conn: sqlite3.Connection, book: str, mode: str, quotes: dict[str, 
     val = portfolio.value(conn, book, now)
     bench = portfolio.benchmark_value(conn, book, weth.price_usd if weth else None)
     portfolio.snapshot(conn, book, now, val, bench,
-                       {"mode": mode, "decisions": out["decisions"], "errors": errors[:30]})
+                       {"mode": mode, "decisions": out["decisions"], "errors": errors[:30], "lost": val.lost})
     out.update(equity_usdc=round(val.equity, 4), risk_equity_usdc=round(val.risk_equity, 4),
                benchmark_usdc=None if bench is None else round(bench, 4), cash_usdc=round(val.cash, 4),
-               stale=val.stale, positions=val.positions,
+               stale=val.stale, lost=val.lost, positions=val.positions,
                halted=portfolio.get_book(conn, book)["halted_reason"])
     return out
 
@@ -95,6 +112,7 @@ def run(book_conn: sqlite3.Connection, x_conn: sqlite3.Connection, *, force: boo
             return log
 
         # 1. Attention X (comptages exacts) et, si demandé, collecte de posts pour la recherche.
+        #    Une erreur ici, quelle qu'elle soit, ne doit jamais empêcher les stop-loss de tourner.
         attention: dict[str, float | None] = {}
         if xsource.configured():
             for sym, query in X_QUERIES.items():
@@ -105,6 +123,8 @@ def run(book_conn: sqlite3.Connection, x_conn: sqlite3.Connection, *, force: boo
                                               X_BUDGET.posts_per_symbol_per_cycle, http, now)
                 except (xsource.XError, ValueError) as e:
                     log["errors"].append(f"X {sym} : {e}")
+                except Exception as e:  # noqa: BLE001 — message non repris : il pourrait contenir un secret
+                    log["errors"].append(f"X {sym} : erreur inattendue ({type(e).__name__})")
                 a = xsource.attention(x_conn, sym, now)
                 attention[sym] = a["ratio"]
                 log["x"][sym] = a
@@ -115,7 +135,10 @@ def run(book_conn: sqlite3.Connection, x_conn: sqlite3.Connection, *, force: boo
         quotes, price_errors = market.fetch_quotes(WHITELIST, http)
         for sym, e in price_errors.items():
             log["errors"].append(f"prix {sym} : {e}")
-        log["fees"] = fees.resolve(book_conn, quotes, http, now)
+        try:
+            log["fees"] = fees.resolve(book_conn, quotes, http, now)
+        except Exception as e:  # noqa: BLE001 — les frais prudents par défaut s'appliquent
+            log["errors"].append(f"frais des pools : erreur inattendue ({type(e).__name__}), 1 % supposé")
 
         # 3. Décisions et ordres de chaque livre, atomiques.
         with write_tx(book_conn):
@@ -127,7 +150,10 @@ def run(book_conn: sqlite3.Connection, x_conn: sqlite3.Connection, *, force: boo
     finally:
         if own:
             http.close()
-        portfolio.release_lock(book_conn, LOCK, holder)
+        try:
+            portfolio.release_lock(book_conn, LOCK, holder)
+        except sqlite3.Error:
+            pass  # le verrou expirera de lui-même ; ne pas masquer l'erreur d'origine
 
 
 def report(book_conn: sqlite3.Connection) -> dict:
@@ -150,24 +176,38 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m crypto_agent.cycle")
     p.add_argument("--init", action="store_true", help="crée la base et les livres")
     p.add_argument("--report", action="store_true", help="état des livres, sans réseau")
-    p.add_argument("--reset-halt", metavar="LIVRE", choices=BOOKS, help="lève l'arrêt d'urgence d'un livre")
+    p.add_argument("--reset-halt", metavar="LIVRE", choices=BOOKS,
+                   help="relance un livre arrêté avec ce qu'il lui reste (décision humaine)")
     p.add_argument("--force", action="store_true", help="ignore l'intervalle minimum entre deux cycles")
     args = p.parse_args(argv)
 
     if args.init:
+        try:
+            capital = start_capital()          # validé AVANT de créer le moindre fichier
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return 1
         conn = open_book(BOOK_DB_PATH, create=True)
         for name in BOOKS:
             try:
-                portfolio.create_book(conn, name, DEFAULT_START_CAPITAL_USDC)
-                print(f"livre « {name} » créé avec {DEFAULT_START_CAPITAL_USDC:g} USDC")
+                portfolio.create_book(conn, name, capital)
+                print(f"livre « {name} » créé avec {capital:g} USDC")
             except portfolio.Refused as e:
                 print(e)
         print(f"base : {BOOK_DB_PATH}")
         return 0
     conn = open_book(BOOK_DB_PATH)
     if args.reset_halt:
-        ok = portfolio.reset_halt(conn, args.reset_halt)
-        print("arrêt levé" if ok else "ce livre n'était pas à l'arrêt")
+        try:
+            res = portfolio.reset_halt(conn, args.reset_halt)
+        except portfolio.Refused as e:
+            print(e, file=sys.stderr)
+            return 1
+        if res is None:
+            print("ce livre n'était pas à l'arrêt")
+        else:
+            print(f"arrêt levé. Capital de référence : {res['old_capital']:.2f} -> {res['new_capital']:.2f} USDC ; "
+                  f"nouveau seuil d'arrêt : {res['new_kill_threshold']:.2f} USDC. La référence ETH reste celle du départ.")
         return 0
     if args.report:
         print(json.dumps(report(conn), indent=2, ensure_ascii=False, default=str))

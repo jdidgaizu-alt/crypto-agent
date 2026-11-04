@@ -155,8 +155,8 @@ def run(series: dict[str, Series], *, step_hours: int = 24, capital: float = 50.
             decisions = strategy.decide(
                 quotes=quotes, attention={s: None for s in quotes}, positions=val.positions, cash=val.cash,
                 risk_equity=val.risk_equity, capital=b["capital_usdc"],
-                trades_today=portfolio.trades_today(conn, BOOK_AUTO, now), halted=b["halted_reason"],
-                recently_sold=portfolio.recently_sold(conn, BOOK_AUTO, now), mode="full",
+                entries_today=portfolio.entries_today(conn, BOOK_AUTO, now), halted=b["halted_reason"],
+                recently_sold=portfolio.recently_sold(conn, BOOK_AUTO, now), mode="full", stale=val.stale,
             )
             for d in decisions:
                 try:

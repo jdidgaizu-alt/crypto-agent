@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS x_counts (
     symbol TEXT NOT NULL, hour_start TEXT NOT NULL, count INTEGER NOT NULL, fetched_at TEXT NOT NULL,
     PRIMARY KEY (symbol, hour_start)
 );
-CREATE TABLE IF NOT EXISTS x_cursor (symbol TEXT PRIMARY KEY, newest_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS x_cursor (symbol TEXT PRIMARY KEY, newest_id TEXT NOT NULL, saved_at TEXT);
 """
 
 
@@ -129,7 +129,11 @@ def open_book(path: Path | str, create: bool = False) -> sqlite3.Connection:
 
 
 def open_x(path: Path | str) -> sqlite3.Connection:
-    return _open(path, X_SCHEMA, create=True)
+    conn = _open(path, X_SCHEMA, create=True)
+    # Base X créée par une version antérieure : colonne ajoutée sans perdre les posts.
+    if "saved_at" not in {r[1] for r in conn.execute("PRAGMA table_info(x_cursor)")}:
+        conn.execute("ALTER TABLE x_cursor ADD COLUMN saved_at TEXT")
+    return conn
 
 
 @contextmanager
@@ -143,7 +147,26 @@ def write_tx(conn: sqlite3.Connection):
     except BaseException:
         conn.execute("ROLLBACK")
         raise
-    conn.execute("COMMIT")
+    try:
+        conn.execute("COMMIT")
+    except BaseException:
+        # Un COMMIT refusé (disque plein, verrou) ne doit pas laisser la transaction ouverte.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
+@contextmanager
+def read_tx(conn: sqlite3.Connection):
+    """Lecture cohérente de plusieurs requêtes (une seule image de la base)."""
+    if conn.in_transaction:
+        yield conn
+        return
+    conn.execute("BEGIN DEFERRED")
+    try:
+        yield conn
+    finally:
+        conn.execute("ROLLBACK")
 
 
 @contextmanager

@@ -122,3 +122,35 @@ def test_addresses_are_validated():
     with pytest.raises(ValueError, match="adresse invalide"):
         chain.check_address("0x123")
     assert chain.check_address(WHITELIST["AERO"]) == WHITELIST["AERO"]
+
+
+def test_malformed_replies_only_drop_the_token_concerned(net):
+    for sym in WHITELIST:
+        net.dex[sym] = [pair(sym)]
+    handler = net.handler
+
+    def odd(request):
+        if request.url.path.endswith(WHITELIST["AERO"]):
+            return httpx.Response(200, json=["pas", "un", "objet"])
+        if request.url.path.endswith(WHITELIST["BRETT"]):
+            return httpx.Response(200, json={"pairs": [{**pair("BRETT"), "baseToken": "texte"}]})
+        return handler(request)
+
+    with httpx.Client(transport=httpx.MockTransport(odd)) as c:
+        quotes, errors = market.fetch_quotes(WHITELIST, c)
+    assert set(quotes) == set(WHITELIST) - {"AERO", "BRETT"}
+    assert "AERO" in errors and "BRETT" in errors
+
+
+def test_misconfigured_rpc_url_is_reported_without_crashing(monkeypatch):
+    monkeypatch.setattr(chain, "BASE_RPC_URL", "https://base.example/KEY\r\n")
+    with httpx.Client() as c:
+        with pytest.raises(chain.RPCUnavailable) as e:
+            chain.block_number(c)
+    assert "KEY" not in str(e.value)
+
+
+def test_non_object_rpc_reply_is_a_clean_error():
+    with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=[1, 2]))) as c:
+        with pytest.raises(chain.RPCUnavailable, match="objet JSON"):
+            chain.block_number(c)

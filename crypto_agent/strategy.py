@@ -1,8 +1,9 @@
 """Décisions : sorties d'abord, garde-fous partagés par tous les ordres, puis un score simple et lisible.
 
-entry_refusal() est l'unique contrôle des achats : la stratégie automatique et les ordres
-de Claude via MCP passent par lui, aucun chemin d'achat ne le contourne.
+entry_refusal() est l'unique contrôle des achats : la stratégie automatique, l'exécution du
+cycle et les ordres de Claude via MCP passent tous par lui, aucun chemin d'achat ne le contourne.
 """
+import math
 from dataclasses import dataclass
 
 from .config import COSTS, RISK
@@ -19,6 +20,11 @@ class Decision:
 
 def _clip(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def floor_cents(x: float) -> float:
+    """Arrondi au centime INFÉRIEUR : un montant arrondi ne dépasse jamais un plafond ou le cash."""
+    return math.floor(x * 100 + 1e-9) / 100
 
 
 def exit_score(q: Quote, attention: float | None) -> float:
@@ -47,38 +53,45 @@ def eligible(q: Quote) -> str | None:
     return None
 
 
-def entry_refusal(*, q: Quote, usdc: float, capital: float, cash: float, held_cost: float,
-                  open_count: int, trades_count: int, halted: str | None, risk_equity: float,
-                  recently_sold: set[str]) -> str | None:
-    """Raison de refuser un achat, ou None s'il respecte tous les garde-fous."""
+def entry_refusal(*, q: Quote, usdc: float, capital: float, cash: float, held_cost: float, open_count: int,
+                  entries_count: int, halted: str | None, risk_equity: float, recently_sold: set[str],
+                  held_value: float = 0.0, unpriced: list[str] | tuple = ()) -> str | None:
+    """Raison de refuser un achat, ou None s'il respecte tous les garde-fous.
+    held_cost / held_value : coût et valeur actuelle de la position déjà détenue sur ce jeton.
+    unpriced : positions du livre sans prix récent (leur risque est inconnu)."""
     if halted:
         return f"livre à l'arrêt ({halted}) : seul un humain peut le relancer"
     if kill_switch(risk_equity, capital):
         return f"capital à risque {risk_equity:.2f} sous le seuil d'arrêt {capital * RISK.kill_switch_frac:.2f}"
+    if unpriced:
+        return f"pas de prix récent pour {', '.join(sorted(unpriced))} : risque du livre inconnu"
     if q.symbol in recently_sold:
         return f"{q.symbol} vendu il y a moins de {RISK.rebuy_cooldown_hours:g} h"
     if (why := eligible(q)):
         return why
-    if usdc < RISK.min_order_usdc:
+    if not usdc >= RISK.min_order_usdc:
         return f"montant minimum {RISK.min_order_usdc:g} USDC"
+    if held_cost > 0 and held_value / held_cost - 1 <= RISK.stop_loss:
+        return f"renfort interdit : la position {q.symbol} est sous son stop-loss ({held_value / held_cost - 1:.1%})"
     cap = capital * RISK.max_position_frac
     if held_cost + usdc > cap + 1e-9:
         return f"position max {cap:.2f} USDC par jeton (déjà {held_cost:.2f} engagés sur {q.symbol})"
     if held_cost == 0 and open_count >= RISK.max_open_positions:
         return f"{RISK.max_open_positions} positions ouvertes au maximum"
-    if trades_count >= RISK.max_trades_per_day:
-        return f"plafond de {RISK.max_trades_per_day} ordres par jour atteint"
+    if entries_count >= RISK.max_entries_per_day:
+        return f"plafond de {RISK.max_entries_per_day} achats par jour atteint"
     if usdc + COSTS.gas_usd > cash - RISK.cash_reserve_usdc + 1e-9:
         return "liquidités insuffisantes (réserve comprise)"
     return None
 
 
 def decide(*, quotes: dict[str, Quote], attention: dict[str, float | None], positions: dict[str, dict],
-           cash: float, risk_equity: float, capital: float, trades_today: int, halted: str | None,
-           recently_sold: set[str], mode: str = "full") -> list[Decision]:
+           cash: float, risk_equity: float, capital: float, entries_today: int, halted: str | None,
+           recently_sold: set[str], mode: str = "full", stale: list[str] | tuple = ()) -> list[Decision]:
     """mode « full » : la stratégie complète (livre auto).
     mode « guard » : protections seules, sans aucune initiative (livre claude) : stop-loss,
-    arrêt total et liquidation. Ni prise de bénéfice, ni sortie sur signal, ni achat."""
+    arrêt total et liquidation. Ni prise de bénéfice, ni sortie sur signal, ni achat.
+    stale : positions dont le prix connu est trop ancien (achats bloqués tant qu'il en reste)."""
     if mode not in ("full", "guard"):
         raise ValueError(f"mode inconnu : {mode}")
     out: list[Decision] = []
@@ -117,8 +130,9 @@ def decide(*, quotes: dict[str, Quote], attention: dict[str, float | None], posi
         return out or [Decision("hold", None, 0, "surveillance : aucune protection déclenchée")]
 
     # 3. Entrées, dans la limite des garde-fous.
+    unpriced = sorted(set(stale) | {s for s in positions if s not in quotes})
     open_count = len(positions) - len(selling)
-    trades_count = trades_today + len(selling)
+    entries = entries_today
     remaining = cash
     ranked = sorted(((score(q, attention.get(s)), s, q) for s, q in quotes.items() if s not in positions),
                     key=lambda t: t[0], reverse=True)
@@ -127,18 +141,19 @@ def decide(*, quotes: dict[str, Quote], attention: dict[str, float | None], posi
             break
         if q.change_24h < 0 or sym in recently_sold or eligible(q):
             continue  # refus propres à ce jeton : on regarde le suivant
-        size = round(min(capital * RISK.max_position_frac,
-                         remaining - COSTS.gas_usd - RISK.cash_reserve_usdc), 2)
+        size = floor_cents(min(capital * RISK.max_position_frac,
+                               remaining - COSTS.gas_usd - RISK.cash_reserve_usdc))
         why = entry_refusal(q=q, usdc=size, capital=capital, cash=remaining, held_cost=0.0,
-                            open_count=open_count, trades_count=trades_count, halted=None,
-                            risk_equity=risk_equity, recently_sold=recently_sold)
+                            open_count=open_count, entries_count=entries, halted=None,
+                            risk_equity=risk_equity, recently_sold=recently_sold, unpriced=unpriced)
         if why:
-            break  # refus global (taille, nombre de positions, plafond, cash) : inutile d'aller plus loin
+            out.append(Decision("warn", sym, 0, f"achat écarté : {why}"))
+            break  # refus global (prix manquant, nombre de positions, plafond, cash) : inutile d'aller plus loin
         att = attention.get(sym)
         att_txt = f"×{att:.2f}" if att is not None else "non mesurée"
         out.append(Decision("buy", sym, size, f"score {sc:.2f} (24 h {q.change_24h:+.1f} %, "
                                               f"1 h {q.change_1h:+.1f} %, attention X {att_txt})"))
         open_count += 1
-        trades_count += 1
+        entries += 1
         remaining -= size + COSTS.gas_usd
     return out or [Decision("hold", None, 0, "aucun signal")]

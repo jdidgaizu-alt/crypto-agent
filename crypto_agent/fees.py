@@ -43,8 +43,8 @@ def resolve(conn: sqlite3.Connection, quotes: dict[str, Quote], client: httpx.Cl
                 fee = chain.pool_fee(q.pair_address, client)
             except chain.RPCUnavailable:
                 rpc_down = True  # inutile d'interroger le nœud pour les jetons suivants
-            except RuntimeError:
-                pass  # pas un pool à liquidité concentrée : valeur prudente
+            except Exception:  # noqa: BLE001 — pas un pool à liquidité concentrée, ou réponse inattendue
+                pass           # valeur prudente
             else:
                 with write_tx(conn):
                     conn.execute(

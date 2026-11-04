@@ -33,8 +33,10 @@ def _rpc(method: str, params: list, client: httpx.Client) -> str:
         body = r.json()
     except httpx.HTTPStatusError as e:
         raise RPCUnavailable(f"RPC Base : statut {e.response.status_code}") from None
-    except (httpx.HTTPError, ValueError) as e:
-        raise RPCUnavailable(f"RPC Base injoignable ({type(e).__name__})") from None
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+        raise RPCUnavailable(f"RPC Base injoignable ou mal configuré ({type(e).__name__})") from None
+    if not isinstance(body, dict):
+        raise RPCUnavailable("RPC Base : réponse qui n'est pas un objet JSON")
     if "error" in body:
         err = body["error"]
         msg = err.get("message", "erreur") if isinstance(err, dict) else "erreur"

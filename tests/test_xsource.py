@@ -20,62 +20,104 @@ def counts(net, x_conn, book_conn, sym="AERO", now=T0):
         return xsource.fetch_counts(x_conn, book_conn, sym, X_QUERIES[sym], c, now)
 
 
-def test_attention_is_unmeasured_until_30_hours_are_counted(x_conn):
+def test_attention_is_unmeasured_until_every_needed_hour_is_counted(x_conn):
     a = xsource.attention(x_conn, "AERO", T0)
-    assert a["ratio"] is None and "30" in a["reason"]
+    assert a["ratio"] is None and "42 heure(s) sans comptage sur 42" in a["reason"]
 
 
-def test_attention_ratio_from_hourly_counts(token, net, x_conn, book_conn):
-    end = xsource._window_end(T0)            # 11:00 : à 12:00:05, l'heure en cours n'est pas complète
-    net.x_rate = lambda sym, h: 300 if h >= end - timedelta(hours=6) else 100
-    assert counts(net, x_conn, book_conn) == 30
+def test_attention_compares_with_the_same_hours_of_previous_days(token, net, x_conn, book_conn):
+    end = xsource._window_end(T0)                # 11:00 : à 12:00:05, l'heure en cours n'est pas complète
+    recent = {end - timedelta(hours=k) for k in range(1, 7)}
+    # Rythme quotidien marqué (300 posts/h de 05:00 à 11:00, 50 le reste du temps), puis un vrai regain
+    # aujourd'hui sur ces mêmes heures (600/h). Le ratio doit voir le regain, pas le rythme de la journée.
+    net.x_rate = lambda sym, h: 600 if h in recent else (300 if 5 <= h.hour < 11 else 50)
+    assert counts(net, x_conn, book_conn) == xsource.WINDOW_HOURS
     a = xsource.attention(x_conn, "AERO", T0)
-    assert a["recent"] == 1800 and a["baseline"] == 600 and a["ratio"] == pytest.approx(3.0)
+    assert a["recent"] == 3600 and a["baseline"] == 1800 and a["ratio"] == pytest.approx(2.0)
+
+
+def test_daily_rhythm_alone_reads_as_neutral(token, net, x_conn, book_conn):
+    net.x_rate = lambda sym, h: 300 if 5 <= h.hour < 11 else 50     # même rythme tous les jours
+    counts(net, x_conn, book_conn)
+    assert xsource.attention(x_conn, "AERO", T0)["ratio"] == pytest.approx(1.0)
 
 
 def test_attention_does_not_depend_on_how_often_we_collect(token, net, x_conn, book_conn):
-    for k in range(8):                                   # 8 collectes rapprochées, activité constante
+    for k in range(8):                                   # 8 cycles rapprochés, activité constante
         counts(net, x_conn, book_conn, now=T0 + timedelta(minutes=5 * k))
     assert xsource.attention(x_conn, "AERO", T0 + timedelta(minutes=40))["ratio"] == pytest.approx(1.0)
+
+
+def test_known_hours_are_not_paid_for_twice(token, net, x_conn, book_conn):
+    counts(net, x_conn, book_conn)
+    paid = len(net.requests)
+    assert counts(net, x_conn, book_conn, now=T0 + timedelta(seconds=20)) == 0     # aucune heure nouvelle : rien à payer
+    assert len(net.requests) == paid
+    assert xsource.spent_this_month(book_conn, T0) == pytest.approx(X_BUDGET.count_request_usd)
+    counts(net, x_conn, book_conn, now=T0 + timedelta(hours=1))                   # une heure de plus : une requête
+    assert len(net.requests) == paid + 1
 
 
 def test_attention_becomes_unmeasured_when_counts_stop(token, net, x_conn, book_conn):
     counts(net, x_conn, book_conn)
     later = T0 + timedelta(hours=7)                      # panne X : plus aucun comptage depuis 7 h
-    a = xsource.attention(x_conn, "AERO", later)
-    assert a["ratio"] is None                            # jamais 0 (qui ferait vendre), jamais 2 (qui ferait acheter)
+    assert xsource.attention(x_conn, "AERO", later)["ratio"] is None   # ni 0 (vente), ni 2 (achat)
 
 
-def test_zero_baseline_gives_no_ratio(token, net, x_conn, book_conn):
-    net.x_rate = lambda sym, h: 0
+def test_thin_baseline_gives_no_ratio(token, net, x_conn, book_conn):
+    net.x_rate = lambda sym, h: 2                       # 12 posts par tranche de 6 h : trop peu pour mesurer
     counts(net, x_conn, book_conn)
-    assert xsource.attention(x_conn, "AERO", T0)["ratio"] is None
+    a = xsource.attention(x_conn, "AERO", T0)
+    assert a["ratio"] is None and "trop peu" in a["reason"]
 
 
-def test_counts_request_only_complete_hours(token, net, x_conn, book_conn):
+def test_counts_request_only_complete_hours_within_seven_days(token, net, x_conn, book_conn):
     counts(net, x_conn, book_conn)
     q = dict(net.requests[-1].url.params)
     # T0 = 12:00:05 : X exige une fin au moins 10 s dans le passé, donc la fenêtre s'arrête à 11:00
-    assert q["end_time"] == "2026-11-03T11:00:00Z" and q["start_time"] == "2026-11-02T05:00:00Z"
+    assert q["end_time"] == "2026-11-03T11:00:00Z" and q["start_time"] == "2026-10-28T05:00:00Z"
     assert q["granularity"] == "hour"
 
 
-def test_budget_is_recorded_and_enforced(token, net, x_conn, book_conn, monkeypatch):
-    counts(net, x_conn, book_conn)
+def test_budget_is_reserved_before_the_request_and_settled_after(token, net, x_conn, book_conn, book_path):
+    from crypto_agent import db
+    seen = []
+    handler = net.handler
+
+    def spy(request):
+        other = db.open_book(book_path)        # ce qu'un appel concurrent verrait pendant la requête
+        seen.append(xsource.spent_this_month(other, T0))
+        other.close()
+        return handler(request)
+
+    with httpx.Client(transport=httpx.MockTransport(spy)) as c:
+        xsource.fetch_counts(x_conn, book_conn, "AERO", X_QUERIES["AERO"], c, T0)
+    assert seen == [pytest.approx(X_BUDGET.count_request_usd)]           # déjà réservé pendant la requête
     assert xsource.spent_this_month(book_conn, T0) == pytest.approx(X_BUDGET.count_request_usd)
+
+
+def test_budget_is_enforced_before_any_request(token, net, x_conn, book_conn, monkeypatch):
     monkeypatch.setattr(xsource, "X_BUDGET", X_BUDGET.__class__(monthly_usd=0.006))
+    counts(net, x_conn, book_conn, sym="AERO")
+    n = len(net.requests)
     with pytest.raises(xsource.XError, match="budget X du mois"):
+        counts(net, x_conn, book_conn, sym="BRETT")
+    assert len(net.requests) == n                         # refusé sans rien envoyer
+
+
+def test_failed_requests_are_refunded(token, net, x_conn, book_conn):
+    net.x_status = 429
+    with pytest.raises(xsource.XError, match="429"):
         counts(net, x_conn, book_conn)
-        counts(net, x_conn, book_conn)
+    assert xsource.spent_this_month(book_conn, T0) == 0
 
 
 def test_bad_token_is_rejected_without_echoing_it(monkeypatch, net, x_conn, book_conn):
     monkeypatch.setenv("X_BEARER_TOKEN", "SECRET-TOKEN-XYZ\r")
-    # la valeur est nettoyée (strip) : un \r final ne casse rien
-    counts(net, x_conn, book_conn)
+    counts(net, x_conn, book_conn)                       # un \r final est retiré : rien ne casse
     monkeypatch.setenv("X_BEARER_TOKEN", "SECRET TOKEN-XYZ")
     with pytest.raises(xsource.XError) as e:
-        counts(net, x_conn, book_conn)
+        counts(net, x_conn, book_conn, sym="BRETT")
     assert "SECRET" not in str(e.value)
 
 
@@ -89,13 +131,6 @@ def test_transport_errors_never_carry_the_token(monkeypatch, x_conn, book_conn):
         with pytest.raises(xsource.XError) as e:
             xsource.fetch_counts(x_conn, book_conn, "AERO", X_QUERIES["AERO"], c, T0)
     assert "SECRET" not in str(e.value) and e.value.__cause__ is None and e.value.__suppress_context__
-
-
-def test_http_errors_are_reported_with_status_only(token, net, x_conn, book_conn):
-    net.x_status = 429
-    with pytest.raises(xsource.XError, match="429"):
-        counts(net, x_conn, book_conn)
-    assert xsource.spent_this_month(book_conn, T0) == 0      # une requête refusée n'est pas comptée
 
 
 # --- collecte de posts et recherche -----------------------------------------
@@ -149,3 +184,44 @@ def test_search_limit_is_bounded(x_conn, limit):
 def test_empty_query_is_refused(x_conn):
     with pytest.raises(ValueError, match="vide"):
         xsource.search(x_conn, "$$$ ###")
+
+
+def test_cursor_is_saved_after_the_first_page_even_if_a_later_page_fails(token, net, x_conn, book_conn):
+    posts = mkposts(150)
+
+    def flaky(request):
+        # X peut renvoyer moins de posts que demandé : première page de 50, puis une panne.
+        if "next_token" in request.url.params:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"data": posts[:50], "meta": {"newest_id": posts[0]["id"], "next_token": "p2"}})
+
+    with httpx.Client(transport=httpx.MockTransport(flaky)) as c:
+        with pytest.raises(xsource.XError, match="503"):
+            xsource.collect_posts(x_conn, book_conn, "AERO", X_QUERIES["AERO"], 100, c, T0)
+    row = x_conn.execute("SELECT newest_id FROM x_cursor WHERE symbol = 'AERO'").fetchone()
+    assert row and row["newest_id"] == posts[0]["id"]
+    assert xsource.spent_this_month(book_conn, T0) == pytest.approx(50 * X_BUDGET.post_read_usd)  # page 2 remboursée
+
+
+def test_old_cursor_is_dropped_before_x_refuses_it(token, net, x_conn, book_conn):
+    net.x_posts["AERO"] = mkposts(20)
+    with net.client() as c:
+        xsource.collect_posts(x_conn, book_conn, "AERO", X_QUERIES["AERO"], 10, c, T0)
+        xsource.collect_posts(x_conn, book_conn, "AERO", X_QUERIES["AERO"], 10, c, T0 + timedelta(days=8))
+    assert "since_id" not in net.requests[-1].url.params
+
+
+def test_long_posts_are_stored_in_full(x_conn):
+    long_text = "aerodrome " * 60
+    xsource.store_posts(x_conn, "AERO", [{"id": "9", "text": "aerodrome tronqué…", "created_at": "2026-11-03T10:00:00Z",
+                                          "note_tweet": {"text": long_text}}])
+    assert x_conn.execute("SELECT text FROM posts WHERE id = '9'").fetchone()[0] == long_text
+
+
+def test_natural_questions_find_posts_containing_any_word(x_conn):
+    xsource.store_posts(x_conn, "AERO", [
+        {"id": "1", "text": "Aerodrome emissions cut announced", "created_at": "2026-11-03T10:00:00Z"},
+        {"id": "2", "text": "unrelated chatter", "created_at": "2026-11-03T10:00:00Z"},
+    ])
+    hits = xsource.search(x_conn, "what is new with aerodrome emissions this week?")
+    assert [h["id"] for h in hits] == ["1"]

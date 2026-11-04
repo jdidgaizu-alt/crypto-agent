@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import fees
 from .config import COSTS, RISK
-from .db import savepoint, write_tx
+from .db import read_tx, savepoint, write_tx
 from .market import Quote
 
 
@@ -154,40 +154,50 @@ def mark_prices(conn: sqlite3.Connection, book: str, quotes: dict[str, Quote], n
 @dataclass
 class Valuation:
     cash: float
-    equity: float                 # positions au dernier prix connu
-    risk_equity: float            # positions sans prix depuis plus de stale_quote_hours comptées pour 0
-    stale: list[str]
+    equity: float                 # toutes les positions au dernier prix connu
+    risk_equity: float            # sans les positions perdues de vue depuis plus de lost_quote_hours
+    stale: list[str]              # prix de plus de stale_quote_hours : risque inconnu, achats bloqués
+    lost: list[str]               # prix de plus de lost_quote_hours : comptées pour 0 dans le capital à risque
     positions: dict[str, dict]
 
 
 def value(conn: sqlite3.Connection, book: str, now: datetime | None = None,
           live: dict[str, float] | None = None) -> Valuation:
-    """Jamais au prix de revient : une position sans cotation garde son dernier prix observé,
-    et sort du capital à risque quand ce prix devient trop ancien."""
+    """Jamais au prix de revient : une position sans cotation garde son dernier prix observé.
+    Au-delà de stale_quote_hours, elle bloque les achats (risque inconnu) ; au-delà de
+    lost_quote_hours, elle sort du capital à risque. Une panne de prix isolée ne déclenche
+    donc pas l'arrêt d'urgence, mais une position introuvable pendant des jours, si."""
     now = now or utcnow()
-    limit = now - timedelta(hours=RISK.stale_quote_hours)
-    b = get_book(conn, book)
-    pos = positions(conn, book)
+    stale_after = now - timedelta(hours=RISK.stale_quote_hours)
+    lost_after = now - timedelta(hours=RISK.lost_quote_hours)
+    with read_tx(conn):
+        b = get_book(conn, book)
+        pos = positions(conn, book)
     equity = risk = b["cash_usdc"]
-    stale = []
+    stale, lost = [], []
     for sym, p in pos.items():
         if live and sym in live:
-            price, fresh = live[sym], True
+            price, seen = live[sym], now
         else:
-            price, fresh = p["last_price"], parse_iso(p["last_price_at"]) >= limit
+            price, seen = p["last_price"], parse_iso(p["last_price_at"])
+        p["price_usd"] = price
         p["value_usdc"] = p["qty"] * price
-        p["price_fresh"] = fresh
+        p["price_fresh"] = seen >= stale_after
         equity += p["value_usdc"]
-        if fresh:
-            risk += p["value_usdc"]
+        if seen < lost_after:
+            lost.append(sym)
         else:
+            risk += p["value_usdc"]
+        if seen < stale_after:
             stale.append(sym)
-    return Valuation(b["cash_usdc"], equity, risk, stale, pos)
+    return Valuation(b["cash_usdc"], equity, risk, sorted(stale), sorted(lost), pos)
 
 
-def trades_today(conn: sqlite3.Connection, book: str, now: datetime) -> int:
+def entries_today(conn: sqlite3.Connection, book: str, now: datetime) -> int:
+    """Achats du jour (UTC). Les ventes ne comptent pas : une sortie n'est jamais bloquée."""
     day = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    return conn.execute("SELECT COUNT(*) FROM trades WHERE book = ? AND ts >= ?", (book, iso(day))).fetchone()[0]
+    return conn.execute("SELECT COUNT(*) FROM trades WHERE book = ? AND side = 'buy' AND ts >= ?",
+                        (book, iso(day))).fetchone()[0]
 
 
 def recently_sold(conn: sqlite3.Connection, book: str, now: datetime) -> set[str]:
@@ -219,12 +229,23 @@ def halt(conn: sqlite3.Connection, book: str, reason: str, now: datetime) -> Non
                  (reason, iso(now), book))
 
 
-def reset_halt(conn: sqlite3.Connection, book: str) -> bool:
-    """Décision humaine uniquement (ligne de commande) : aucun outil MCP n'y donne accès."""
+def reset_halt(conn: sqlite3.Connection, book: str, now: datetime | None = None) -> dict | None:
+    """Décision humaine uniquement (ligne de commande) : aucun outil MCP n'y donne accès.
+    Le livre repart avec ce qu'il lui reste : le capital de référence des garde-fous devient
+    la valeur actuelle, sinon le seuil d'arrêt, calculé sur l'ancien capital, l'arrêterait aussitôt.
+    La référence ETH, elle, reste celle du départ : la comparaison continue d'inclure les pertes."""
+    now = now or utcnow()
     with write_tx(conn):
-        cur = conn.execute("UPDATE books SET halted_reason = NULL, halted_at = NULL "
-                           "WHERE name = ? AND halted_reason IS NOT NULL", (book,))
-    return cur.rowcount == 1
+        b = get_book(conn, book)
+        if b["halted_reason"] is None:
+            return None
+        val = value(conn, book, now)
+        if val.equity < 10:
+            raise Refused(f"il ne reste que {val.equity:.2f} USDC : trop peu pour respecter l'ordre minimum")
+        conn.execute("UPDATE books SET halted_reason = NULL, halted_at = NULL, capital_usdc = ? WHERE name = ?",
+                     (val.equity, book))
+    return {"old_capital": b["capital_usdc"], "new_capital": val.equity,
+            "new_kill_threshold": val.equity * RISK.kill_switch_frac}
 
 
 def snapshot(conn: sqlite3.Connection, book: str, now: datetime, val: Valuation,

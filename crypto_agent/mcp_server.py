@@ -70,6 +70,8 @@ def _tool(description: str):
                 raise ToolError(f"erreur réseau ({type(e).__name__})") from None
             except _EXPECTED as e:
                 raise ToolError(str(e)[:400] or type(e).__name__) from None
+            except Exception as e:  # noqa: BLE001 — réponse amont inattendue : on dit quoi, sans le message
+                raise ToolError(f"erreur inattendue ({type(e).__name__}) : réessayez plus tard") from None
         return server.tool(description=description)(wrapper)
     return deco
 
@@ -85,7 +87,12 @@ def _symbol(s: str) -> str:
 def market_snapshot() -> dict:
     with http_client() as c:
         quotes, errors = market.fetch_quotes(WHITELIST, c)
-    return {"quotes": [asdict(q) for q in quotes.values()], "errors": errors}
+        fee_sources = {}
+        if config.BOOK_DB_PATH.exists():
+            with _book_db() as book:
+                fee_sources = fees.resolve(book, quotes, c)
+    return {"quotes": [asdict(q) | {"total_fee_rate": fees.total_fee_rate(q)} for q in quotes.values()],
+            "fee_sources": fee_sources, "errors": errors}
 
 
 @_tool("Attention sur X pour un jeton : posts des 6 dernières heures / moyenne des 24 h précédentes. "
@@ -100,6 +107,7 @@ def x_attention(symbol: str) -> dict:
        "pour la recherche. COÛTE de l'argent réel : 0,005 $ par post lu, dans la limite du budget mensuel.")
 def x_collect(symbol: str, max_posts: int = 20) -> dict:
     sym = _symbol(symbol)
+    xsource.check_max_posts(max_posts)
     with _book_db() as book, _x_db() as x, http_client() as c:
         hours = xsource.fetch_counts(x, book, sym, X_QUERIES[sym], c)
         res = xsource.collect_posts(x, book, sym, X_QUERIES[sym], max_posts, c)
@@ -128,7 +136,9 @@ def portfolio_status() -> dict:
     with _book_db() as book:
         held = {r[0] for r in book.execute("SELECT DISTINCT symbol FROM positions")} | {"WETH"}
         with http_client() as c:
-            quotes, errors = market.fetch_quotes({s: WHITELIST[s] for s in held}, c)
+            quotes, errors = market.fetch_quotes({s: WHITELIST[s] for s in held if s in WHITELIST}, c)
+        for s in sorted(held - set(WHITELIST)):
+            errors[s] = "jeton retiré de la liste blanche : valorisé à son dernier prix connu"
         live = {s: q.price_usd for s, q in quotes.items()}
         out: dict = {"errors": errors, "books": {}}
         for name in BOOKS:
@@ -156,12 +166,21 @@ def paper_trade(symbol: str, side: Literal["buy", "sell"], reason: str, usdc: fl
     reason = (reason or "").strip()
     if len(reason) < 5:
         raise ToolError("donnez la raison de l'ordre (5 caractères minimum)")
+    if side == "sell" and usdc is not None:
+        raise ToolError("une vente cède toute la position : n'indiquez pas de montant (usdc)")
     now = portfolio.utcnow()
     with _book_db() as book, http_client() as c:
-        quotes, errors = market.fetch_quotes({sym: WHITELIST[sym], "WETH": WHITELIST["WETH"]}, c)
+        # Tout le livre est réévalué, pas seulement le jeton échangé : le contrôle du risque
+        # porte sur l'ensemble des positions, et des prix anciens fausseraient l'arrêt d'urgence.
+        held = {r[0] for r in book.execute("SELECT symbol FROM positions WHERE book = ?", (BOOK_CLAUDE,))}
+        wanted = (held | {sym, "WETH"}) & set(WHITELIST)
+        quotes, errors = market.fetch_quotes({s: WHITELIST[s] for s in sorted(wanted)}, c)
         if sym not in quotes:
             raise ToolError(f"pas de cotation fiable pour {sym} : {errors.get(sym, 'inconnue')}")
-        fees.resolve(book, quotes, c, now)
+        try:
+            fees.resolve(book, quotes, c, now)
+        except Exception:  # noqa: BLE001 — frais prudents par défaut
+            pass
         q = quotes[sym]
         refusal = None
         with write_tx(book):
@@ -175,14 +194,18 @@ def paper_trade(symbol: str, side: Literal["buy", "sell"], reason: str, usdc: fl
                 amount = portfolio.check_amount(usdc)
                 val = portfolio.value(book, BOOK_CLAUDE, now)
                 pos = val.positions.get(sym)
+                unpriced = sorted(s for s in val.positions if s not in quotes)
                 why = strategy.entry_refusal(
                     q=q, usdc=amount, capital=b["capital_usdc"], cash=val.cash,
-                    held_cost=pos["cost_usdc"] if pos else 0.0, open_count=len(val.positions),
-                    trades_count=portfolio.trades_today(book, BOOK_CLAUDE, now), halted=b["halted_reason"],
-                    risk_equity=val.risk_equity, recently_sold=portfolio.recently_sold(book, BOOK_CLAUDE, now))
+                    held_cost=pos["cost_usdc"] if pos else 0.0, held_value=pos["qty"] * q.price_usd if pos else 0.0,
+                    open_count=len(val.positions), entries_count=portfolio.entries_today(book, BOOK_CLAUDE, now),
+                    halted=b["halted_reason"], risk_equity=val.risk_equity,
+                    recently_sold=portfolio.recently_sold(book, BOOK_CLAUDE, now), unpriced=unpriced)
                 if why:
-                    # L'arrêt doit survivre au refus : on valide la transaction, puis on refuse.
-                    if not b["halted_reason"] and strategy.kill_switch(val.risk_equity, b["capital_usdc"]):
+                    # L'arrêt n'est verrouillé que sur une valorisation COMPLÈTE (toutes les positions cotées
+                    # à l'instant), et il doit survivre au refus : on valide la transaction, puis on refuse.
+                    if (not b["halted_reason"] and not unpriced
+                            and strategy.kill_switch(val.risk_equity, b["capital_usdc"])):
                         portfolio.halt(book, BOOK_CLAUDE, why, now)
                     refusal = f"achat refusé : {why}"
                 else:
@@ -196,14 +219,16 @@ def paper_trade(symbol: str, side: Literal["buy", "sell"], reason: str, usdc: fl
                 weth = quotes.get("WETH")
                 portfolio.snapshot(book, BOOK_CLAUDE, now, val,
                                    portfolio.benchmark_value(book, BOOK_CLAUDE, weth.price_usd if weth else None),
-                                   {"mode": "manual", "decisions": [result], "errors": list(errors.values())})
+                                   {"mode": "manual", "decisions": [result], "errors": list(errors.values()),
+                                    "stale": val.stale})
         if refusal:
             raise ToolError(refusal)
-        return {"result": result, "cash_usdc": val.cash, "equity_usdc": val.equity}
+        return {"result": result, "cash_usdc": val.cash, "equity_usdc": val.equity, "stale": val.stale}
 
 
 @_tool("Lance un cycle : comptages X, prix, protections et stratégie automatique, instantanés. "
-       "Refusé si le dernier cycle date de moins de 30 minutes.")
+       "Refusé si le dernier cycle date de moins de 30 minutes. Chaque cycle peut coûter jusqu'à 0,03 $ "
+       "de comptages X (budget mensuel partagé avec x_collect) : un cycle par jour suffit à la stratégie.")
 def run_cycle() -> dict:
     with _book_db() as book, _x_db() as x, http_client() as c:
         return cycle.run(book, x, http=c)

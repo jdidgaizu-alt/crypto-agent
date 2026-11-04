@@ -35,11 +35,16 @@ def _num(x) -> float | None:
     return v if math.isfinite(v) else None
 
 
+def _d(x) -> dict:
+    """Le dictionnaire attendu, ou un dictionnaire vide si la réponse a une autre forme."""
+    return x if isinstance(x, dict) else {}
+
+
 def _is_candidate(p: dict, address: str) -> bool:
     if not isinstance(p, dict) or p.get("chainId") != CHAIN_ID:
         return False
-    base = p.get("baseToken") or {}
-    quote = p.get("quoteToken") or {}
+    base = _d(p.get("baseToken"))
+    quote = _d(p.get("quoteToken"))
     if str(base.get("address", "")).lower() != address.lower():
         return False
     if str(quote.get("address", "")).lower() not in ALLOWED_QUOTES:
@@ -49,7 +54,7 @@ def _is_candidate(p: dict, address: str) -> bool:
 
 
 def _liquidity(p: dict) -> float:
-    return _num((p.get("liquidity") or {}).get("usd")) or 0.0
+    return _num(_d(p.get("liquidity")).get("usd")) or 0.0
 
 
 def pick_best_pair(pairs: list, address: str) -> dict | None:
@@ -59,12 +64,12 @@ def pick_best_pair(pairs: list, address: str) -> dict | None:
 
 
 def parse_quote(symbol: str, address: str, pair: dict, pairs: list) -> Quote | None:
-    base = pair.get("baseToken") or {}
+    base = _d(pair.get("baseToken"))
     if str(base.get("symbol", "")).upper() != symbol.upper():
         return None  # adresse incohérente avec le symbole attendu : on refuse
-    change = pair.get("priceChange") or {}
+    change = _d(pair.get("priceChange"))
     volume = sum(
-        _num((p.get("volume") or {}).get("h24")) or 0.0 for p in pairs if _is_candidate(p, address)
+        _num(_d(p.get("volume")).get("h24")) or 0.0 for p in pairs if _is_candidate(p, address)
     )
     return Quote(
         symbol=symbol,
@@ -77,7 +82,7 @@ def parse_quote(symbol: str, address: str, pair: dict, pairs: list) -> Quote | N
         pair_url=str(pair.get("url", "")),
         pair_address=str(pair.get("pairAddress", "")),
         dex_id=str(pair.get("dexId", "")),
-        quote_symbol=ALLOWED_QUOTES[str((pair.get("quoteToken") or {}).get("address", "")).lower()],
+        quote_symbol=ALLOWED_QUOTES[str(_d(pair.get("quoteToken")).get("address", "")).lower()],
     )
 
 
@@ -88,7 +93,7 @@ def _get_pairs(client: httpx.Client, address: str, retries: int, backoff: float)
             time.sleep(backoff * (attempt + 1))
             continue
         r.raise_for_status()
-        pairs = r.json().get("pairs")
+        pairs = _d(r.json()).get("pairs")
         return pairs if isinstance(pairs, list) else []
     return []  # inatteignable
 
@@ -109,14 +114,18 @@ def fetch_quotes(tokens: dict[str, str], client: httpx.Client | None = None,
             except httpx.HTTPStatusError as e:
                 errors[sym] = f"DexScreener a répondu {e.response.status_code}"
                 continue
-            except (httpx.HTTPError, ValueError) as e:
+            except Exception as e:  # noqa: BLE001 — un jeton illisible ne doit pas priver les autres de prix
                 errors[sym] = f"DexScreener injoignable ou illisible ({type(e).__name__})"
                 continue
             pair = pick_best_pair(pairs, addr)
             if pair is None:
                 errors[sym] = "aucune paire Base cotée en USDC/WETH/ETH avec un prix"
                 continue
-            q = parse_quote(sym, addr, pair, pairs)
+            try:
+                q = parse_quote(sym, addr, pair, pairs)
+            except Exception as e:  # noqa: BLE001
+                errors[sym] = f"réponse DexScreener inattendue ({type(e).__name__})"
+                continue
             if q is None:
                 errors[sym] = "symbole renvoyé différent du symbole attendu"
                 continue

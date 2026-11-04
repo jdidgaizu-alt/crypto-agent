@@ -177,13 +177,49 @@ def test_missing_quote_values_position_at_last_price_not_cost(book_conn):
     assert val.stale == [] and val.risk_equity == pytest.approx(val.equity)
 
 
-def test_stale_position_counts_zero_in_risk_equity(book_conn):
+def test_stale_position_keeps_its_last_price_and_lost_position_counts_zero(book_conn):
     buy(book_conn, mkq(price=2.0), 10)
-    later = T0 + timedelta(hours=RISK.stale_quote_hours + 1)
-    val = portfolio.value(book_conn, "auto", later)
-    assert val.stale == ["AERO"]
-    assert val.risk_equity == pytest.approx(val.cash)
-    assert val.equity > val.risk_equity
+    day_later = T0 + timedelta(hours=24)                 # une panne de prix sur un cycle quotidien
+    val = portfolio.value(book_conn, "auto", day_later)
+    assert val.stale == ["AERO"] and val.lost == []
+    assert val.risk_equity == pytest.approx(val.equity)  # pas de fausse alerte : l'arrêt ne se déclenche pas
+    much_later = T0 + timedelta(hours=RISK.lost_quote_hours + 1)
+    val = portfolio.value(book_conn, "auto", much_later)
+    assert val.lost == ["AERO"] and val.risk_equity == pytest.approx(val.cash)
+    assert val.positions["AERO"]["price_usd"] == 2.0     # le prix utilisé est affiché
+
+
+def test_sell_costs_are_exact_for_unknown_fee_and_weth_quoted_pools(book_conn):
+    for sym, quote, fee, rate in (("AERO", "USDC", None, 0.01), ("BRETT", "WETH", 0.01, 0.0105)):
+        q = mkq(sym, price=1.0, liq=5e6, quote=quote, fee=fee)
+        b = buy(book_conn, q, 10)
+        assert b["fee_rate"] == pytest.approx(rate)
+        before = cash(book_conn)
+        s = sell(book_conn, q)
+        out = b["qty"] / (1 + 2 * b["qty"] / 5e6)
+        assert s["proceeds"] == pytest.approx(out * (1 - rate) - COSTS.gas_usd, abs=1e-12)
+        assert s["fees"] == pytest.approx(out * rate + COSTS.gas_usd, abs=1e-12)
+        assert cash(book_conn) - before == pytest.approx(s["proceeds"], abs=1e-12)
+
+
+def test_reset_halt_restarts_the_book_with_what_is_left(book_conn):
+    with write_tx(book_conn):
+        book_conn.execute("UPDATE books SET cash_usdc = 28, halted_reason = 'arrêt' WHERE name = 'auto'")
+    res = portfolio.reset_halt(book_conn, "auto", T0)
+    assert res == {"old_capital": 50.0, "new_capital": 28.0, "new_kill_threshold": pytest.approx(16.8)}
+    b = portfolio.get_book(book_conn, "auto")
+    assert b["halted_reason"] is None and b["capital_usdc"] == 28.0
+    assert portfolio.reset_halt(book_conn, "auto", T0) is None          # pas à l'arrêt : rien à faire
+    with write_tx(book_conn):
+        book_conn.execute("UPDATE books SET cash_usdc = 5, halted_reason = 'arrêt' WHERE name = 'auto'")
+    with pytest.raises(portfolio.Refused, match="trop peu"):
+        portfolio.reset_halt(book_conn, "auto", T0)
+
+
+def test_entries_today_counts_buys_only(book_conn):
+    buy(book_conn, mkq(), 10)
+    sell(book_conn, mkq())
+    assert portfolio.entries_today(book_conn, "auto", T0) == 1
 
 
 def test_benchmark_is_the_start_capital_in_eth_whatever_happened_before(book_conn):
